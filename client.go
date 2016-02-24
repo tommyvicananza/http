@@ -74,6 +74,58 @@ func (c *Client) Do(method, url string, headers map[string][]string, body io.Rea
 	return rstatus, rheaders, rc, err
 }
 
+func (c *Client) DoUnix(method, url string, headers map[string][]string, body io.Reader) (client.Status, map[string][]string, io.ReadCloser, error) {
+	if headers == nil {
+		headers = make(map[string][]string)
+	}
+	u, err := stdurl.ParseRequestURI(url)
+	if err != nil {
+		return client.Status{}, nil, nil, err
+	}
+	host := u.Host
+	headers["Host"] = []string{host}
+	if !strings.Contains(host, ":") {
+		host += ":80"
+	}
+	path := u.Path
+	if path == "" {
+		path = "/"
+	}
+	if u.RawQuery != "" {
+		path += "?" + u.RawQuery
+	}
+	conn, err := c.dialer.Dial("unix", "/var/run/docker.sock")
+	if err != nil {
+		return client.Status{}, nil, nil, err
+	}
+	req := toRequest(method, path, nil, headers, body)
+	if err := conn.WriteRequest(req); err != nil {
+		return client.Status{}, nil, nil, err
+	}
+	resp, err := conn.ReadResponse()
+	if err != nil {
+		return client.Status{}, nil, nil, err
+	}
+	_, rstatus, rheaders, rbody := fromResponse(resp)
+	if headerValue(rheaders, "Content-Encoding") == "gzip" {
+		rbody, err = gzip.NewReader(rbody)
+	}
+	rc := &readCloser{rbody, conn}
+	if rstatus.IsRedirect() && c.FollowRedirects {
+		// consume the response body
+		_, err := io.Copy(ioutil.Discard, rc)
+		if err := firstErr(err, rc.Close()); err != nil {
+			return client.Status{}, nil, nil, err // TODO
+		}
+		loc := headerValue(rheaders, "Location")
+		if strings.HasPrefix(loc, "/") {
+			loc = fmt.Sprintf("http://%s%s", host, loc)
+		}
+		return c.Do(method, loc, headers, body)
+	}
+	return rstatus, rheaders, rc, err
+}
+
 // StatusError reprents a client.Status as an error.
 type StatusError struct {
 	client.Status
